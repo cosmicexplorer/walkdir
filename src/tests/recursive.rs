@@ -13,10 +13,10 @@ fn send_sync_traits() {
 
     assert_send::<WalkDir>();
     assert_sync::<WalkDir>();
-    assert_send::<IntoIter>();
-    assert_sync::<IntoIter>();
-    assert_send::<FilterEntry<IntoIter, u8>>();
-    assert_sync::<FilterEntry<IntoIter, u8>>();
+    assert_send::<IntoIter<()>>();
+    assert_sync::<IntoIter<()>>();
+    assert_send::<FilterEntry<IntoIter<()>, u8>>();
+    assert_sync::<FilterEntry<IntoIter<()>, u8>>();
 }
 
 #[test]

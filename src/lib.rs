@@ -231,54 +231,372 @@ pub type Result<T> = ::std::result::Result<T, Error>;
 /// Note that when following symbolic/soft links, loops are detected and an
 /// error is reported.
 #[derive(Debug)]
-pub struct WalkDir {
-    opts: WalkDirOptions,
+pub struct WalkDir<Sorter = ()> {
+    opts: WalkDirOptions<Sorter>,
     root: PathBuf,
 }
 
-struct WalkDirOptions {
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct WalkDirBasicOptions {
     follow_links: bool,
     follow_root_links: bool,
     max_open: usize,
     min_depth: usize,
     max_depth: usize,
-    sorter: Option<
-        Box<
-            dyn FnMut(&DirEntry, &DirEntry) -> Ordering
-                + Send
-                + Sync
-                + 'static,
-        >,
-    >,
     contents_first: bool,
     same_file_system: bool,
 }
 
-impl fmt::Debug for WalkDirOptions {
-    fn fmt(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-    ) -> result::Result<(), fmt::Error> {
-        let sorter_str = if self.sorter.is_some() {
-            // FnMut isn't `Debug`
-            "Some(...)"
-        } else {
-            "None"
-        };
-        f.debug_struct("WalkDirOptions")
-            .field("follow_links", &self.follow_links)
-            .field("follow_root_link", &self.follow_root_links)
-            .field("max_open", &self.max_open)
-            .field("min_depth", &self.min_depth)
-            .field("max_depth", &self.max_depth)
-            .field("sorter", &sorter_str)
-            .field("contents_first", &self.contents_first)
-            .field("same_file_system", &self.same_file_system)
-            .finish()
+impl WalkDirBasicOptions {
+    pub const fn new() -> Self {
+        Self {
+            follow_links: false,
+            follow_root_links: true,
+            max_open: 10,
+            min_depth: 0,
+            max_depth: ::std::usize::MAX,
+            contents_first: false,
+            same_file_system: false,
+        }
+    }
+
+    pub fn set_min_depth(&mut self, depth: usize) {
+        self.min_depth = depth;
+        if self.min_depth > self.max_depth {
+            self.min_depth = self.max_depth;
+        }
+    }
+
+    pub fn set_max_depth(&mut self, depth: usize) {
+        self.max_depth = depth;
+        if self.max_depth < self.min_depth {
+            self.max_depth = self.min_depth;
+        }
+    }
+
+    pub fn set_follow_links(&mut self, yes: bool) {
+        self.follow_links = yes;
+    }
+
+    pub fn set_follow_root_links(&mut self, yes: bool) {
+        self.follow_root_links = yes;
+    }
+
+    pub fn set_max_open(&mut self, mut n: usize) {
+        if n == 0 {
+            n = 1;
+        }
+        self.max_open = n;
+    }
+
+    pub fn set_contents_first(&mut self, yes: bool) {
+        self.contents_first = yes;
+    }
+
+    pub fn set_same_file_system(&mut self, yes: bool) {
+        self.same_file_system = yes;
     }
 }
 
-impl WalkDir {
+impl Default for WalkDirBasicOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct SortOptions<Sorter>(Sorter);
+
+impl<Sorter> SortOptions<Sorter> {
+    pub const fn new(sorter: Sorter) -> Self {
+        Self(sorter)
+    }
+}
+
+mod sealed {
+    use super::preprocessing::SortPair;
+    use super::{DirEntry, SortOptions};
+
+    use std::cmp::Ordering;
+
+    #[doc(hidden)]
+    pub trait Sealed {}
+
+    #[doc(hidden)]
+    pub trait SortExtension: Sealed {
+        const CAN_COMPARE: bool;
+        fn compare_entries(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering;
+    }
+
+    impl Sealed for () {}
+    impl SortExtension for () {
+        const CAN_COMPARE: bool = false;
+        #[inline(always)]
+        fn compare_entries(
+            &mut self,
+            _lhs: &DirEntry,
+            _rhs: &DirEntry,
+        ) -> Ordering {
+            unreachable!()
+        }
+    }
+
+    impl<S> Sealed for SortOptions<S> {}
+    impl<S> SortExtension for SortOptions<S>
+    where
+        S: SortPair,
+    {
+        const CAN_COMPARE: bool = true;
+        #[inline(always)]
+        fn compare_entries(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let Self(c) = self;
+            c.compare_pair(lhs, rhs)
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct WalkDirOptions<Sorter> {
+    basic: WalkDirBasicOptions,
+    sorting: SortOptions<Sorter>,
+}
+
+impl<Sorter> AsRef<WalkDirBasicOptions> for WalkDirOptions<Sorter> {
+    fn as_ref(&self) -> &WalkDirBasicOptions {
+        &self.basic
+    }
+}
+
+impl<Sorter> AsMut<WalkDirBasicOptions> for WalkDirOptions<Sorter> {
+    fn as_mut(&mut self) -> &mut WalkDirBasicOptions {
+        &mut self.basic
+    }
+}
+
+impl Default for WalkDirOptions<()> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WalkDirOptions<()> {
+    pub const fn new() -> Self {
+        Self { basic: WalkDirBasicOptions::new(), sorting: SortOptions(()) }
+    }
+
+    pub const fn with_sorter<Sorter>(
+        self,
+        sorter: Sorter,
+    ) -> WalkDirOptions<Sorter>
+    where
+        Sorter: preprocessing::SortPair,
+    {
+        let Self { basic, sorting: SortOptions(()) } = self;
+        WalkDirOptions { basic, sorting: SortOptions::new(sorter) }
+    }
+}
+
+#[doc(hidden)]
+pub mod preprocessing {
+    use std::cmp::{Ord, Ordering};
+    use std::ffi::OsStr;
+    use std::fmt;
+    use std::path::Path;
+
+    use super::DirEntry;
+
+    pub trait SortPair {
+        fn compare_pair(&mut self, lhs: &DirEntry, rhs: &DirEntry)
+            -> Ordering;
+    }
+
+    pub struct SortFun<F>(F);
+
+    impl<F> SortFun<F> {
+        pub const fn new(fun: F) -> Self {
+            Self(fun)
+        }
+    }
+
+    impl<F> From<F> for SortFun<F>
+    where
+        F: FnMut(&DirEntry, &DirEntry) -> Ordering,
+    {
+        fn from(f: F) -> Self {
+            Self::new(f)
+        }
+    }
+
+    impl<F> fmt::Debug for SortFun<F> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "SortFun(...)")
+        }
+    }
+
+    impl<F> SortPair for SortFun<F>
+    where
+        F: FnMut(&DirEntry, &DirEntry) -> Ordering,
+    {
+        fn compare_pair(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let Self(f) = self;
+            f(lhs, rhs)
+        }
+    }
+
+    pub trait SortKey {
+        type Key<'k>
+        where
+            Self: 'k;
+        fn comparison_key<'k, 'e: 'k>(
+            &mut self,
+            entry: &'e DirEntry,
+        ) -> Self::Key<'k>;
+    }
+
+    impl<SK> SortPair for SK
+    where
+        SK: SortKey,
+        for<'k> SK::Key<'k>: Ord,
+    {
+        #[inline(always)]
+        fn compare_pair(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let lhs = self.comparison_key(lhs);
+            let rhs = self.comparison_key(rhs);
+            lhs.cmp(&rhs)
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct ByName;
+
+    impl SortKey for ByName {
+        type Key<'k> = &'k OsStr;
+        #[inline(always)]
+        fn comparison_key<'k, 'e: 'k>(
+            &mut self,
+            entry: &'e DirEntry,
+        ) -> Self::Key<'k> {
+            entry.file_name()
+        }
+    }
+
+    #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+    pub struct ByPath;
+
+    impl SortKey for ByPath {
+        type Key<'k> = &'k Path;
+        #[inline(always)]
+        fn comparison_key<'k, 'e: 'k>(
+            &mut self,
+            entry: &'e DirEntry,
+        ) -> Self::Key<'k> {
+            entry.path()
+        }
+    }
+
+    pub struct KeyFun<F>(F);
+
+    impl<F> KeyFun<F> {
+        pub const fn new(fun: F) -> Self {
+            Self(fun)
+        }
+    }
+
+    impl<K, F> From<F> for KeyFun<F>
+    where
+        for<'k> F: FnMut(&'k DirEntry) -> &'k K,
+        for<'k> K: 'k,
+        for<'k> F: 'k,
+    {
+        fn from(f: F) -> Self {
+            Self::new(f)
+        }
+    }
+
+    impl<F> fmt::Debug for KeyFun<F> {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "KeyFun(...)")
+        }
+    }
+
+    impl<K, F> SortKey for KeyFun<F>
+    where
+        for<'k> F: FnMut(&'k DirEntry) -> &'k K,
+        for<'k> K: 'k,
+        for<'k> F: 'k,
+    {
+        type Key<'k>
+            = &'k K
+        where
+            Self: 'k;
+        #[inline(always)]
+        fn comparison_key<'k, 'e: 'k>(
+            &mut self,
+            entry: &'e DirEntry,
+        ) -> Self::Key<'k> {
+            let Self(f) = self;
+            f(entry)
+        }
+    }
+
+    pub struct SortKeyFun<F, K> {
+        sort: F,
+        key: K,
+    }
+
+    impl<F, K> SortKeyFun<F, K> {
+        pub const fn new(sort: F, key: K) -> Self {
+            Self { sort, key }
+        }
+    }
+
+    impl<F, K> fmt::Debug for SortKeyFun<F, K>
+    where
+        K: fmt::Debug,
+    {
+        fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.debug_struct("SortKeyFun")
+                .field("sort", &"(...)")
+                .field("key", &self.key)
+                .finish()
+        }
+    }
+
+    impl<F, K> SortPair for SortKeyFun<F, K>
+    where
+        K: SortKey,
+        for<'e> F: FnMut(K::Key<'e>, K::Key<'e>) -> Ordering,
+    {
+        fn compare_pair(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            let Self { sort, key } = self;
+            let lhs = key.comparison_key(lhs);
+            let rhs = key.comparison_key(rhs);
+            sort(lhs, rhs)
+        }
+    }
+}
+
+impl WalkDir<()> {
     /// Create a builder for a recursive directory iterator starting at the
     /// file path `root`. If `root` is a directory, then it is the first item
     /// yielded by the iterator. If `root` is a file, then it is the first
@@ -288,30 +606,23 @@ impl WalkDir {
     /// the `follow_links` setting.)
     pub fn new<P: AsRef<Path>>(root: P) -> Self {
         WalkDir {
-            opts: WalkDirOptions {
-                follow_links: false,
-                follow_root_links: true,
-                max_open: 10,
-                min_depth: 0,
-                max_depth: ::std::usize::MAX,
-                sorter: None,
-                contents_first: false,
-                same_file_system: false,
-            },
+            opts: WalkDirOptions::new(),
             root: root.as_ref().to_path_buf(),
         }
     }
+}
 
+impl<Sorter> WalkDir<Sorter>
+where
+    Sorter: sealed::SortExtension,
+{
     /// Set the minimum depth of entries yielded by the iterator.
     ///
     /// The smallest depth is `0` and always corresponds to the path given
     /// to the `new` function on this type. Its direct descendents have depth
     /// `1`, and their descendents have depth `2`, and so on.
     pub fn min_depth(mut self, depth: usize) -> Self {
-        self.opts.min_depth = depth;
-        if self.opts.min_depth > self.opts.max_depth {
-            self.opts.min_depth = self.opts.max_depth;
-        }
+        self.opts.basic.set_min_depth(depth);
         self
     }
 
@@ -325,10 +636,7 @@ impl WalkDir {
     /// it will actually avoid descending into directories when the depth is
     /// exceeded.
     pub fn max_depth(mut self, depth: usize) -> Self {
-        self.opts.max_depth = depth;
-        if self.opts.max_depth < self.opts.min_depth {
-            self.opts.max_depth = self.opts.min_depth;
-        }
+        self.opts.basic.set_max_depth(depth);
         self
     }
 
@@ -344,7 +652,7 @@ impl WalkDir {
     ///
     /// [`DirEntry`]: struct.DirEntry.html
     pub fn follow_links(mut self, yes: bool) -> Self {
-        self.opts.follow_links = yes;
+        self.opts.basic.set_follow_links(yes);
         self
     }
 
@@ -363,7 +671,7 @@ impl WalkDir {
     ///
     /// [`DirEntry`]: struct.DirEntry.html
     pub fn follow_root_links(mut self, yes: bool) -> Self {
-        self.opts.follow_root_links = yes;
+        self.opts.basic.set_follow_root_links(yes);
         self
     }
 
@@ -392,69 +700,9 @@ impl WalkDir {
     /// On Windows, if `follow_links` is enabled, then this limit is not
     /// respected. In particular, the maximum number of file descriptors opened
     /// is proportional to the depth of the directory tree traversed.
-    pub fn max_open(mut self, mut n: usize) -> Self {
-        if n == 0 {
-            n = 1;
-        }
-        self.opts.max_open = n;
+    pub fn max_open(mut self, n: usize) -> Self {
+        self.opts.basic.set_max_open(n);
         self
-    }
-
-    /// Set a function for sorting directory entries with a comparator
-    /// function.
-    ///
-    /// If a compare function is set, the resulting iterator will return all
-    /// paths in sorted order. The compare function will be called to compare
-    /// entries from the same directory.
-    ///
-    /// ```rust,no_run
-    /// use std::cmp;
-    /// use std::ffi::OsString;
-    /// use walkdir::WalkDir;
-    ///
-    /// WalkDir::new("foo").sort_by(|a,b| a.file_name().cmp(b.file_name()));
-    /// ```
-    pub fn sort_by<F>(mut self, cmp: F) -> Self
-    where
-        F: FnMut(&DirEntry, &DirEntry) -> Ordering + Send + Sync + 'static,
-    {
-        self.opts.sorter = Some(Box::new(cmp));
-        self
-    }
-
-    /// Set a function for sorting directory entries with a key extraction
-    /// function.
-    ///
-    /// If a compare function is set, the resulting iterator will return all
-    /// paths in sorted order. The compare function will be called to compare
-    /// entries from the same directory.
-    ///
-    /// ```rust,no_run
-    /// use std::cmp;
-    /// use std::ffi::OsString;
-    /// use walkdir::WalkDir;
-    ///
-    /// WalkDir::new("foo").sort_by_key(|a| a.file_name().to_owned());
-    /// ```
-    pub fn sort_by_key<K, F>(self, mut cmp: F) -> Self
-    where
-        F: FnMut(&DirEntry) -> K + Send + Sync + 'static,
-        K: Ord,
-    {
-        self.sort_by(move |a, b| cmp(a).cmp(&cmp(b)))
-    }
-
-    /// Sort directory entries by file name, to ensure a deterministic order.
-    ///
-    /// This is a convenience function for calling `Self::sort_by()`.
-    ///
-    /// ```rust,no_run
-    /// use walkdir::WalkDir;
-    ///
-    /// WalkDir::new("foo").sort_by_file_name();
-    /// ```
-    pub fn sort_by_file_name(self) -> Self {
-        self.sort_by(|a, b| a.file_name().cmp(b.file_name()))
     }
 
     /// Yield a directory's contents before the directory itself. By default,
@@ -515,7 +763,7 @@ impl WalkDir {
     /// // foo
     /// ```
     pub fn contents_first(mut self, yes: bool) -> Self {
-        self.opts.contents_first = yes;
+        self.opts.basic.set_contents_first(yes);
         self
     }
 
@@ -528,16 +776,99 @@ impl WalkDir {
     /// option is used on an unsupported platform, then directory traversal
     /// will immediately return an error and will not yield any entries.
     pub fn same_file_system(mut self, yes: bool) -> Self {
-        self.opts.same_file_system = yes;
+        self.opts.basic.set_same_file_system(yes);
         self
     }
 }
 
-impl IntoIterator for WalkDir {
-    type Item = Result<DirEntry>;
-    type IntoIter = IntoIter;
+impl WalkDir<()> {
+    /// Set a function for sorting directory entries with a comparator
+    /// function.
+    ///
+    /// If a compare function is set, the resulting iterator will return all
+    /// paths in sorted order. The compare function will be called to compare
+    /// entries from the same directory.
+    ///
+    /// ```rust,no_run
+    /// use std::cmp;
+    /// use std::ffi::OsString;
+    /// use walkdir::WalkDir;
+    ///
+    /// WalkDir::new("foo").sort_by(|a,b| a.file_name().cmp(b.file_name()));
+    /// ```
+    pub fn sort_by<F>(self, cmp: F) -> WalkDir<preprocessing::SortFun<F>>
+    where
+        F: FnMut(&DirEntry, &DirEntry) -> Ordering,
+    {
+        self.sort_by_pair(cmp)
+    }
 
-    fn into_iter(self) -> IntoIter {
+    #[doc(hidden)]
+    pub fn sort_by_pair<S>(self, cmp: impl Into<S>) -> WalkDir<S>
+    where
+        S: preprocessing::SortPair,
+    {
+        let Self { opts, root } = self;
+        WalkDir { opts: opts.with_sorter(cmp.into()), root }
+    }
+
+    /// Set a function for sorting directory entries with a key extraction
+    /// function.
+    ///
+    /// If a compare function is set, the resulting iterator will return all
+    /// paths in sorted order. The compare function will be called to compare
+    /// entries from the same directory.
+    ///
+    /// ```rust,no_run
+    /// use std::cmp;
+    /// use std::ffi::OsString;
+    /// use walkdir::WalkDir;
+    ///
+    /// WalkDir::new("foo").sort_by_key(|a| a.file_name().to_owned());
+    /// ```
+    pub fn sort_by_key<K, F>(self, key: F) -> WalkDir<preprocessing::KeyFun<F>>
+    where
+        for<'k> F: FnMut(&'k DirEntry) -> &'k K,
+        for<'k> K: 'k,
+        for<'k> F: 'k,
+        K: Ord,
+    {
+        self.sort_by_keyer(key)
+    }
+
+    #[doc(hidden)]
+    pub fn sort_by_keyer<SK>(self, key: impl Into<SK>) -> WalkDir<SK>
+    where
+        SK: preprocessing::SortKey,
+        for<'k> SK::Key<'k>: Ord,
+    {
+        let Self { opts, root } = self;
+        WalkDir { opts: opts.with_sorter(key.into()), root }
+    }
+
+    /// Sort directory entries by file name, to ensure a deterministic order.
+    ///
+    /// This is a convenience function for calling `Self::sort_by()`.
+    ///
+    /// ```rust,no_run
+    /// use walkdir::WalkDir;
+    ///
+    /// WalkDir::new("foo").sort_by_file_name();
+    /// ```
+    pub fn sort_by_file_name(self) -> WalkDir<preprocessing::ByName> {
+        let Self { opts, root } = self;
+        WalkDir { opts: opts.with_sorter(preprocessing::ByName), root }
+    }
+}
+
+impl<Sorter> IntoIterator for WalkDir<Sorter>
+where
+    Sorter: sealed::SortExtension,
+{
+    type Item = Result<DirEntry>;
+    type IntoIter = IntoIter<Sorter>;
+
+    fn into_iter(self) -> Self::IntoIter {
         IntoIter {
             opts: self.opts,
             start: Some(self.root),
@@ -563,9 +894,9 @@ impl IntoIterator for WalkDir {
 /// [`WalkDir`]: struct.WalkDir.html
 /// [`.into_iter()`]: struct.WalkDir.html#into_iter.v
 #[derive(Debug)]
-pub struct IntoIter {
+pub struct IntoIter<Sorter> {
     /// Options specified in the builder. Depths, max fds, etc.
-    opts: WalkDirOptions,
+    opts: WalkDirOptions<Sorter>,
     /// The start path.
     ///
     /// This is only `Some(...)` at the beginning. After the first iteration,
@@ -676,7 +1007,10 @@ enum DirList {
     Closed(vec::IntoIter<Result<DirEntry>>),
 }
 
-impl Iterator for IntoIter {
+impl<Sorter> Iterator for IntoIter<Sorter>
+where
+    Sorter: sealed::SortExtension,
+{
     type Item = Result<DirEntry>;
     /// Advances the iterator and returns the next value.
     ///
@@ -686,7 +1020,7 @@ impl Iterator for IntoIter {
     /// an error value. The error will be wrapped in an Option::Some.
     fn next(&mut self) -> Option<Result<DirEntry>> {
         if let Some(start) = self.start.take() {
-            if self.opts.same_file_system {
+            if self.opts.as_ref().same_file_system {
                 let result = util::device_num(&start)
                     .map_err(|e| Error::from_path(0, start.clone(), e));
                 self.root_device = Some(itry!(result));
@@ -701,7 +1035,7 @@ impl Iterator for IntoIter {
             if let Some(dentry) = self.get_deferred_dir() {
                 return Some(Ok(dentry));
             }
-            if self.depth > self.opts.max_depth {
+            if self.depth > self.opts.as_ref().max_depth {
                 // If we've exceeded the max depth, pop the current dir
                 // so that we don't descend.
                 self.pop();
@@ -724,7 +1058,7 @@ impl Iterator for IntoIter {
                 }
             }
         }
-        if self.opts.contents_first {
+        if self.opts.as_ref().contents_first {
             self.depth = self.stack_list.len();
             if let Some(dentry) = self.get_deferred_dir() {
                 return Some(Ok(dentry));
@@ -734,7 +1068,7 @@ impl Iterator for IntoIter {
     }
 }
 
-impl IntoIter {
+impl<Sorter> IntoIter<Sorter> {
     /// Skips the current directory.
     ///
     /// This causes the iterator to stop traversing the contents of the least
@@ -837,16 +1171,16 @@ impl IntoIter {
         FilterEntry { it: self, predicate }
     }
 
-    fn handle_entry(
-        &mut self,
-        mut dent: DirEntry,
-    ) -> Option<Result<DirEntry>> {
-        if self.opts.follow_links && dent.file_type().is_symlink() {
+    fn handle_entry(&mut self, mut dent: DirEntry) -> Option<Result<DirEntry>>
+    where
+        Sorter: sealed::SortExtension,
+    {
+        if self.opts.as_ref().follow_links && dent.file_type().is_symlink() {
             dent = itry!(self.follow(dent));
         }
         let is_normal_dir = !dent.file_type().is_symlink() && dent.is_dir();
         if is_normal_dir {
-            if self.opts.same_file_system && dent.depth() > 0 {
+            if self.opts.as_ref().same_file_system && dent.depth() > 0 {
                 if itry!(self.is_same_file_system(&dent)) {
                     itry!(self.push(&dent));
                 }
@@ -855,7 +1189,7 @@ impl IntoIter {
             }
         } else if dent.depth() == 0
             && dent.file_type().is_symlink()
-            && self.opts.follow_root_links
+            && self.opts.as_ref().follow_root_links
         {
             // As a special case, if we are processing a root entry, then we
             // always follow it even if it's a symlink and follow_links is
@@ -871,7 +1205,7 @@ impl IntoIter {
                 itry!(self.push(&dent));
             }
         }
-        if is_normal_dir && self.opts.contents_first {
+        if is_normal_dir && self.opts.as_ref().contents_first {
             self.deferred_dirs.push(dent);
             None
         } else if self.skippable() {
@@ -882,7 +1216,7 @@ impl IntoIter {
     }
 
     fn get_deferred_dir(&mut self) -> Option<DirEntry> {
-        if self.opts.contents_first {
+        if self.opts.as_ref().contents_first {
             if self.depth < self.deferred_dirs.len() {
                 // Unwrap is safe here because we've guaranteed that
                 // `self.deferred_dirs.len()` can never be less than 1
@@ -898,11 +1232,14 @@ impl IntoIter {
         None
     }
 
-    fn push(&mut self, dent: &DirEntry) -> Result<()> {
+    fn push(&mut self, dent: &DirEntry) -> Result<()>
+    where
+        Sorter: sealed::SortExtension,
+    {
         // Make room for another open file descriptor if we've hit the max.
         let free =
             self.stack_list.len().checked_sub(self.oldest_opened).unwrap();
-        if free == self.opts.max_open {
+        if free == self.opts.as_ref().max_open {
             self.stack_list[self.oldest_opened].close();
         }
         // Open a handle to reading the directory's entries.
@@ -910,17 +1247,20 @@ impl IntoIter {
             Some(Error::from_path(self.depth, dent.path().to_path_buf(), err))
         });
         let mut list = DirList::Opened { depth: self.depth, it: rd };
-        if let Some(ref mut cmp) = self.opts.sorter {
+
+        if Sorter::CAN_COMPARE {
+            let SortOptions(ref mut cmp) = self.opts.sorting;
             let mut entries: Vec<_> = list.collect();
             entries.sort_by(|a, b| match (a, b) {
-                (&Ok(ref a), &Ok(ref b)) => cmp(a, b),
+                (&Ok(ref a), &Ok(ref b)) => cmp.compare_entries(a, b),
                 (&Err(_), &Err(_)) => Ordering::Equal,
                 (&Ok(_), &Err(_)) => Ordering::Greater,
                 (&Err(_), &Ok(_)) => Ordering::Less,
             });
             list = DirList::Closed(entries.into_iter());
         }
-        if self.opts.follow_links {
+
+        if self.opts.as_ref().follow_links {
             let ancestor = Ancestor::new(&dent)
                 .map_err(|err| Error::from_io(self.depth, err))?;
             self.stack_path.push(ancestor);
@@ -937,7 +1277,7 @@ impl IntoIter {
         // We could move the close of the stream above into this if-body, but
         // then we would have more than the maximum number of file descriptors
         // open at a particular point in time.
-        if free == self.opts.max_open {
+        if free == self.opts.as_ref().max_open {
             // Unwrap is safe here because self.oldest_opened is guaranteed to
             // never be greater than `self.stack_list.len()`, which implies
             // that the subtraction won't underflow and that adding 1 will
@@ -949,7 +1289,7 @@ impl IntoIter {
 
     fn pop(&mut self) {
         self.stack_list.pop().expect("BUG: cannot pop from empty stack");
-        if self.opts.follow_links {
+        if self.opts.as_ref().follow_links {
             self.stack_path.pop().expect("BUG: list/path stacks out of sync");
         }
         // If everything in the stack is already closed, then there is
@@ -998,11 +1338,15 @@ impl IntoIter {
     }
 
     fn skippable(&self) -> bool {
-        self.depth < self.opts.min_depth || self.depth > self.opts.max_depth
+        self.depth < self.opts.as_ref().min_depth
+            || self.depth > self.opts.as_ref().max_depth
     }
 }
 
-impl iter::FusedIterator for IntoIter {}
+impl<Sorter> iter::FusedIterator for IntoIter<Sorter> where
+    Sorter: sealed::SortExtension
+{
+}
 
 impl DirList {
     fn close(&mut self) {
@@ -1057,9 +1401,10 @@ pub struct FilterEntry<I, P> {
     predicate: P,
 }
 
-impl<P> Iterator for FilterEntry<IntoIter, P>
+impl<P, Sorter> Iterator for FilterEntry<IntoIter<Sorter>, P>
 where
     P: FnMut(&DirEntry) -> bool,
+    Sorter: sealed::SortExtension,
 {
     type Item = Result<DirEntry>;
 
@@ -1086,12 +1431,14 @@ where
     }
 }
 
-impl<P> iter::FusedIterator for FilterEntry<IntoIter, P> where
-    P: FnMut(&DirEntry) -> bool
+impl<P, Sorter> iter::FusedIterator for FilterEntry<IntoIter<Sorter>, P>
+where
+    P: FnMut(&DirEntry) -> bool,
+    Sorter: sealed::SortExtension,
 {
 }
 
-impl<P> FilterEntry<IntoIter, P>
+impl<P, Sorter> FilterEntry<IntoIter<Sorter>, P>
 where
     P: FnMut(&DirEntry) -> bool,
 {
