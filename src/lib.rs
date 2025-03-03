@@ -313,7 +313,8 @@ impl<Sorter> SortOptions<Sorter> {
     }
 }
 
-mod sealed {
+#[doc(hidden)]
+pub mod sealed {
     use super::preprocessing::SortPair;
     use super::{DirEntry, SortOptions};
 
@@ -321,6 +322,7 @@ mod sealed {
 
     #[doc(hidden)]
     pub trait Sealed {}
+    impl<'a, S> Sealed for &'a mut S where S: Sealed {}
 
     #[doc(hidden)]
     pub trait SortExtension: Sealed {
@@ -330,6 +332,21 @@ mod sealed {
             lhs: &DirEntry,
             rhs: &DirEntry,
         ) -> Ordering;
+    }
+
+    impl<'a, S> SortExtension for &'a mut S
+    where
+        S: SortExtension,
+    {
+        const CAN_COMPARE: bool = S::CAN_COMPARE;
+        #[inline(always)]
+        fn compare_entries(
+            &mut self,
+            lhs: &DirEntry,
+            rhs: &DirEntry,
+        ) -> Ordering {
+            (**self).compare_entries(lhs, rhs)
+        }
     }
 
     impl Sealed for () {}
@@ -401,6 +418,17 @@ impl WalkDirOptions<()> {
     {
         let Self { basic, sorting: () } = self;
         WalkDirOptions { basic, sorting: SortOptions::new(sorter) }
+    }
+
+    pub const fn with_prepared_sorter<Sorter>(
+        self,
+        sorter: Sorter,
+    ) -> WalkDirOptions<Sorter>
+    where
+        Sorter: sealed::SortExtension,
+    {
+        let Self { basic, sorting: () } = self;
+        WalkDirOptions { basic, sorting: sorter }
     }
 }
 
@@ -815,6 +843,15 @@ impl WalkDir<()> {
     {
         let Self { opts, root } = self;
         WalkDir { opts: opts.with_sorter(cmp.into()), root }
+    }
+
+    #[doc(hidden)]
+    pub fn provide_prepared_sort<S>(self, sorter: S) -> WalkDir<S>
+    where
+        S: sealed::SortExtension,
+    {
+        let Self { opts, root } = self;
+        WalkDir { opts: opts.with_prepared_sorter(sorter), root }
     }
 
     /// Set a function for sorting directory entries with a key extraction
