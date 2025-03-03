@@ -110,7 +110,6 @@ for entry in walker.filter_entry(|e| !is_hidden(e)) {
 doc_comment::doctest!("../README.md");
 
 use std::cmp::{min, Ordering};
-use std::fmt;
 use std::fs::{self, ReadDir};
 use std::io;
 use std::iter;
@@ -304,8 +303,9 @@ impl Default for WalkDirBasicOptions {
     }
 }
 
+#[doc(hidden)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-struct SortOptions<Sorter>(Sorter);
+pub struct SortOptions<Sorter>(Sorter);
 
 impl<Sorter> SortOptions<Sorter> {
     pub const fn new(sorter: Sorter) -> Self {
@@ -366,7 +366,7 @@ mod sealed {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 struct WalkDirOptions<Sorter> {
     basic: WalkDirBasicOptions,
-    sorting: SortOptions<Sorter>,
+    sorting: Sorter,
 }
 
 impl<Sorter> AsRef<WalkDirBasicOptions> for WalkDirOptions<Sorter> {
@@ -389,17 +389,17 @@ impl Default for WalkDirOptions<()> {
 
 impl WalkDirOptions<()> {
     pub const fn new() -> Self {
-        Self { basic: WalkDirBasicOptions::new(), sorting: SortOptions(()) }
+        Self { basic: WalkDirBasicOptions::new(), sorting: () }
     }
 
     pub const fn with_sorter<Sorter>(
         self,
         sorter: Sorter,
-    ) -> WalkDirOptions<Sorter>
+    ) -> WalkDirOptions<SortOptions<Sorter>>
     where
         Sorter: preprocessing::SortPair,
     {
-        let Self { basic, sorting: SortOptions(()) } = self;
+        let Self { basic, sorting: () } = self;
         WalkDirOptions { basic, sorting: SortOptions::new(sorter) }
     }
 }
@@ -523,6 +523,7 @@ pub mod preprocessing {
         for<'k> F: FnMut(&'k DirEntry) -> &'k K,
         for<'k> K: 'k,
         for<'k> F: 'k,
+        K: ?Sized,
     {
         fn from(f: F) -> Self {
             Self::new(f)
@@ -540,6 +541,7 @@ pub mod preprocessing {
         for<'k> F: FnMut(&'k DirEntry) -> &'k K,
         for<'k> K: 'k,
         for<'k> F: 'k,
+        K: ?Sized,
     {
         type Key<'k>
             = &'k K
@@ -796,7 +798,10 @@ impl WalkDir<()> {
     ///
     /// WalkDir::new("foo").sort_by(|a,b| a.file_name().cmp(b.file_name()));
     /// ```
-    pub fn sort_by<F>(self, cmp: F) -> WalkDir<preprocessing::SortFun<F>>
+    pub fn sort_by<F>(
+        self,
+        cmp: F,
+    ) -> WalkDir<SortOptions<preprocessing::SortFun<F>>>
     where
         F: FnMut(&DirEntry, &DirEntry) -> Ordering,
     {
@@ -804,7 +809,7 @@ impl WalkDir<()> {
     }
 
     #[doc(hidden)]
-    pub fn sort_by_pair<S>(self, cmp: impl Into<S>) -> WalkDir<S>
+    pub fn sort_by_pair<S>(self, cmp: impl Into<S>) -> WalkDir<SortOptions<S>>
     where
         S: preprocessing::SortPair,
     {
@@ -824,20 +829,26 @@ impl WalkDir<()> {
     /// use std::ffi::OsString;
     /// use walkdir::WalkDir;
     ///
-    /// WalkDir::new("foo").sort_by_key(|a| a.file_name().to_owned());
+    /// WalkDir::new("foo").sort_by_key(|a| a.file_name());
     /// ```
-    pub fn sort_by_key<K, F>(self, key: F) -> WalkDir<preprocessing::KeyFun<F>>
+    pub fn sort_by_key<K, F>(
+        self,
+        key: F,
+    ) -> WalkDir<SortOptions<preprocessing::KeyFun<F>>>
     where
         for<'k> F: FnMut(&'k DirEntry) -> &'k K,
         for<'k> K: 'k,
         for<'k> F: 'k,
-        K: Ord,
+        K: Ord + ?Sized,
     {
         self.sort_by_keyer(key)
     }
 
     #[doc(hidden)]
-    pub fn sort_by_keyer<SK>(self, key: impl Into<SK>) -> WalkDir<SK>
+    pub fn sort_by_keyer<SK>(
+        self,
+        key: impl Into<SK>,
+    ) -> WalkDir<SortOptions<SK>>
     where
         SK: preprocessing::SortKey,
         for<'k> SK::Key<'k>: Ord,
@@ -855,7 +866,9 @@ impl WalkDir<()> {
     ///
     /// WalkDir::new("foo").sort_by_file_name();
     /// ```
-    pub fn sort_by_file_name(self) -> WalkDir<preprocessing::ByName> {
+    pub fn sort_by_file_name(
+        self,
+    ) -> WalkDir<SortOptions<preprocessing::ByName>> {
         let Self { opts, root } = self;
         WalkDir { opts: opts.with_sorter(preprocessing::ByName), root }
     }
@@ -1249,7 +1262,7 @@ impl<Sorter> IntoIter<Sorter> {
         let mut list = DirList::Opened { depth: self.depth, it: rd };
 
         if Sorter::CAN_COMPARE {
-            let SortOptions(ref mut cmp) = self.opts.sorting;
+            let ref mut cmp = self.opts.sorting;
             let mut entries: Vec<_> = list.collect();
             entries.sort_by(|a, b| match (a, b) {
                 (&Ok(ref a), &Ok(ref b)) => cmp.compare_entries(a, b),

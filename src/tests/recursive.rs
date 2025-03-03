@@ -975,8 +975,7 @@ fn sort_by_key() {
     dir.mkdirp("foo/bar/baz/abc");
     dir.mkdirp("quux");
 
-    let wd =
-        WalkDir::new(dir.path()).sort_by_key(|a| a.file_name().to_owned());
+    let wd = WalkDir::new(dir.path()).sort_by_key(|a| a.file_name());
     let r = dir.run_recursive(wd);
     r.assert_no_errors();
 
