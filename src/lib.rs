@@ -313,19 +313,14 @@ impl<Sorter> SortOptions<Sorter> {
     }
 }
 
-#[doc(hidden)]
-pub mod sealed {
+mod sort_ext {
     use super::preprocessing::SortPair;
     use super::{DirEntry, SortOptions};
 
     use std::cmp::Ordering;
 
     #[doc(hidden)]
-    pub trait Sealed {}
-    impl<'a, S> Sealed for &'a mut S where S: Sealed {}
-
-    #[doc(hidden)]
-    pub trait SortExtension: Sealed {
+    pub trait SortExtension {
         const CAN_COMPARE: bool;
         fn compare_entries(
             &mut self,
@@ -349,7 +344,6 @@ pub mod sealed {
         }
     }
 
-    impl Sealed for () {}
     impl SortExtension for () {
         const CAN_COMPARE: bool = false;
         #[inline(always)]
@@ -362,7 +356,6 @@ pub mod sealed {
         }
     }
 
-    impl<S> Sealed for SortOptions<S> {}
     impl<S> SortExtension for SortOptions<S>
     where
         S: SortPair,
@@ -384,18 +377,6 @@ pub mod sealed {
 struct WalkDirOptions<Sorter> {
     basic: WalkDirBasicOptions,
     sorting: Sorter,
-}
-
-impl<Sorter> AsRef<WalkDirBasicOptions> for WalkDirOptions<Sorter> {
-    fn as_ref(&self) -> &WalkDirBasicOptions {
-        &self.basic
-    }
-}
-
-impl<Sorter> AsMut<WalkDirBasicOptions> for WalkDirOptions<Sorter> {
-    fn as_mut(&mut self) -> &mut WalkDirBasicOptions {
-        &mut self.basic
-    }
 }
 
 impl Default for WalkDirOptions<()> {
@@ -425,7 +406,7 @@ impl WalkDirOptions<()> {
         sorter: Sorter,
     ) -> WalkDirOptions<Sorter>
     where
-        Sorter: sealed::SortExtension,
+        Sorter: sort_ext::SortExtension,
     {
         let Self { basic, sorting: () } = self;
         WalkDirOptions { basic, sorting: sorter }
@@ -644,7 +625,7 @@ impl WalkDir<()> {
 
 impl<Sorter> WalkDir<Sorter>
 where
-    Sorter: sealed::SortExtension,
+    Sorter: sort_ext::SortExtension,
 {
     /// Set the minimum depth of entries yielded by the iterator.
     ///
@@ -848,7 +829,7 @@ impl WalkDir<()> {
     #[doc(hidden)]
     pub fn provide_prepared_sort<S>(self, sorter: S) -> WalkDir<S>
     where
-        S: sealed::SortExtension,
+        S: sort_ext::SortExtension,
     {
         let Self { opts, root } = self;
         WalkDir { opts: opts.with_prepared_sorter(sorter), root }
@@ -913,7 +894,7 @@ impl WalkDir<()> {
 
 impl<Sorter> IntoIterator for WalkDir<Sorter>
 where
-    Sorter: sealed::SortExtension,
+    Sorter: sort_ext::SortExtension,
 {
     type Item = Result<DirEntry>;
     type IntoIter = IntoIter<Sorter>;
@@ -1059,7 +1040,7 @@ enum DirList {
 
 impl<Sorter> Iterator for IntoIter<Sorter>
 where
-    Sorter: sealed::SortExtension,
+    Sorter: sort_ext::SortExtension,
 {
     type Item = Result<DirEntry>;
     /// Advances the iterator and returns the next value.
@@ -1070,7 +1051,7 @@ where
     /// an error value. The error will be wrapped in an Option::Some.
     fn next(&mut self) -> Option<Result<DirEntry>> {
         if let Some(start) = self.start.take() {
-            if self.opts.as_ref().same_file_system {
+            if self.opts.basic.same_file_system {
                 let result = util::device_num(&start)
                     .map_err(|e| Error::from_path(0, start.clone(), e));
                 self.root_device = Some(itry!(result));
@@ -1085,7 +1066,7 @@ where
             if let Some(dentry) = self.get_deferred_dir() {
                 return Some(Ok(dentry));
             }
-            if self.depth > self.opts.as_ref().max_depth {
+            if self.depth > self.opts.basic.max_depth {
                 // If we've exceeded the max depth, pop the current dir
                 // so that we don't descend.
                 self.pop();
@@ -1108,7 +1089,7 @@ where
                 }
             }
         }
-        if self.opts.as_ref().contents_first {
+        if self.opts.basic.contents_first {
             self.depth = self.stack_list.len();
             if let Some(dentry) = self.get_deferred_dir() {
                 return Some(Ok(dentry));
@@ -1223,14 +1204,14 @@ impl<Sorter> IntoIter<Sorter> {
 
     fn handle_entry(&mut self, mut dent: DirEntry) -> Option<Result<DirEntry>>
     where
-        Sorter: sealed::SortExtension,
+        Sorter: sort_ext::SortExtension,
     {
-        if self.opts.as_ref().follow_links && dent.file_type().is_symlink() {
+        if self.opts.basic.follow_links && dent.file_type().is_symlink() {
             dent = itry!(self.follow(dent));
         }
         let is_normal_dir = !dent.file_type().is_symlink() && dent.is_dir();
         if is_normal_dir {
-            if self.opts.as_ref().same_file_system && dent.depth() > 0 {
+            if self.opts.basic.same_file_system && dent.depth() > 0 {
                 if itry!(self.is_same_file_system(&dent)) {
                     itry!(self.push(&dent));
                 }
@@ -1239,7 +1220,7 @@ impl<Sorter> IntoIter<Sorter> {
             }
         } else if dent.depth() == 0
             && dent.file_type().is_symlink()
-            && self.opts.as_ref().follow_root_links
+            && self.opts.basic.follow_root_links
         {
             // As a special case, if we are processing a root entry, then we
             // always follow it even if it's a symlink and follow_links is
@@ -1255,7 +1236,7 @@ impl<Sorter> IntoIter<Sorter> {
                 itry!(self.push(&dent));
             }
         }
-        if is_normal_dir && self.opts.as_ref().contents_first {
+        if is_normal_dir && self.opts.basic.contents_first {
             self.deferred_dirs.push(dent);
             None
         } else if self.skippable() {
@@ -1266,7 +1247,7 @@ impl<Sorter> IntoIter<Sorter> {
     }
 
     fn get_deferred_dir(&mut self) -> Option<DirEntry> {
-        if self.opts.as_ref().contents_first {
+        if self.opts.basic.contents_first {
             if self.depth < self.deferred_dirs.len() {
                 // Unwrap is safe here because we've guaranteed that
                 // `self.deferred_dirs.len()` can never be less than 1
@@ -1284,12 +1265,12 @@ impl<Sorter> IntoIter<Sorter> {
 
     fn push(&mut self, dent: &DirEntry) -> Result<()>
     where
-        Sorter: sealed::SortExtension,
+        Sorter: sort_ext::SortExtension,
     {
         // Make room for another open file descriptor if we've hit the max.
         let free =
             self.stack_list.len().checked_sub(self.oldest_opened).unwrap();
-        if free == self.opts.as_ref().max_open {
+        if free == self.opts.basic.max_open {
             self.stack_list[self.oldest_opened].close();
         }
         // Open a handle to reading the directory's entries.
@@ -1308,9 +1289,11 @@ impl<Sorter> IntoIter<Sorter> {
                 (&Err(_), &Ok(_)) => Ordering::Less,
             });
             list = DirList::Closed(entries.into_iter());
+        } else {
+            list.close();
         }
 
-        if self.opts.as_ref().follow_links {
+        if self.opts.basic.follow_links {
             let ancestor = Ancestor::new(&dent)
                 .map_err(|err| Error::from_io(self.depth, err))?;
             self.stack_path.push(ancestor);
@@ -1327,7 +1310,7 @@ impl<Sorter> IntoIter<Sorter> {
         // We could move the close of the stream above into this if-body, but
         // then we would have more than the maximum number of file descriptors
         // open at a particular point in time.
-        if free == self.opts.as_ref().max_open {
+        if free == self.opts.basic.max_open {
             // Unwrap is safe here because self.oldest_opened is guaranteed to
             // never be greater than `self.stack_list.len()`, which implies
             // that the subtraction won't underflow and that adding 1 will
@@ -1339,7 +1322,7 @@ impl<Sorter> IntoIter<Sorter> {
 
     fn pop(&mut self) {
         self.stack_list.pop().expect("BUG: cannot pop from empty stack");
-        if self.opts.as_ref().follow_links {
+        if self.opts.basic.follow_links {
             self.stack_path.pop().expect("BUG: list/path stacks out of sync");
         }
         // If everything in the stack is already closed, then there is
@@ -1388,13 +1371,13 @@ impl<Sorter> IntoIter<Sorter> {
     }
 
     fn skippable(&self) -> bool {
-        self.depth < self.opts.as_ref().min_depth
-            || self.depth > self.opts.as_ref().max_depth
+        self.depth < self.opts.basic.min_depth
+            || self.depth > self.opts.basic.max_depth
     }
 }
 
 impl<Sorter> iter::FusedIterator for IntoIter<Sorter> where
-    Sorter: sealed::SortExtension
+    Sorter: sort_ext::SortExtension
 {
 }
 
@@ -1454,7 +1437,7 @@ pub struct FilterEntry<I, P> {
 impl<P, Sorter> Iterator for FilterEntry<IntoIter<Sorter>, P>
 where
     P: FnMut(&DirEntry) -> bool,
-    Sorter: sealed::SortExtension,
+    Sorter: sort_ext::SortExtension,
 {
     type Item = Result<DirEntry>;
 
@@ -1484,7 +1467,7 @@ where
 impl<P, Sorter> iter::FusedIterator for FilterEntry<IntoIter<Sorter>, P>
 where
     P: FnMut(&DirEntry) -> bool,
-    Sorter: sealed::SortExtension,
+    Sorter: sort_ext::SortExtension,
 {
 }
 
