@@ -910,16 +910,30 @@ impl IntoIter {
             Some(Error::from_path(self.depth, dent.path().to_path_buf(), err))
         });
         let mut list = DirList::Opened { depth: self.depth, it: rd };
+
+        // If no sorter is provided, then we don't iterate through any entries yet. If it is, then
+        // we eagerly collect entries and can close the handle.
         if let Some(ref mut cmp) = self.opts.sorter {
-            let mut entries: Vec<_> = list.collect();
-            entries.sort_by(|a, b| match (a, b) {
-                (&Ok(ref a), &Ok(ref b)) => cmp(a, b),
-                (&Err(_), &Err(_)) => Ordering::Equal,
-                (&Ok(_), &Err(_)) => Ordering::Greater,
-                (&Err(_), &Ok(_)) => Ordering::Less,
-            });
+            let mut errors = Vec::new();
+            let mut successes = Vec::new();
+            for el in list {
+                match el {
+                    Ok(e) => successes.push(e),
+                    Err(e) => errors.push(e),
+                }
+            }
+            // We sort successes, but not errors.
+            successes.sort_by(cmp);
+            // Errors come first.
+            let entries: Vec<_> = errors
+                .into_iter()
+                .map(Err)
+                .chain(successes.into_iter().map(Ok))
+                .collect();
+            // We've iterated through all the entries, so we've closed this handle.
             list = DirList::Closed(entries.into_iter());
         }
+
         if self.opts.follow_links {
             let ancestor = Ancestor::new(&dent)
                 .map_err(|err| Error::from_io(self.depth, err))?;
